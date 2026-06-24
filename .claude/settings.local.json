@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(npx eslint *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(npm run *)",
+      "Bash(sips -g pixelWidth -g pixelHeight public/assets/kenney/base/Tilemap/tilemap-characters_packed.png)",
+      "Bash(node -e 'const d=require\\(\"./src/levels/test.json\"\\); const ids=new Set\\(\\); for\\(const l of d.layers\\) for\\(const row of l.data\\) for\\(const v of row\\) if\\(v\\) ids.add\\(v\\); console.log\\(\"nonzero ids:\",[...ids].sort\\(\\(a,b\\)=>a-b\\)\\); console.log\\(\"dims:\",d.width+\"x\"+d.height,\"tileSize\",d.tileSize\\);')",
+      "Bash(node -e ' *)",
+      "Bash(npx vite *)",
+      "Bash(sips -g pixelWidth -g pixelHeight ./public/assets/kenney/base/Tilemap/tilemap_packed.png)",
+      "Bash(mkdir -p /tmp/atlas)",
+      "Bash(sips -z 648 1440 ./public/assets/kenney/base/Tilemap/tilemap_packed.png --out /tmp/atlas/packed_big.png)",
+      "Bash(npm i *)",
+      "Bash(node --input-type=module -e ' *)"
+    ]
+  }
+}

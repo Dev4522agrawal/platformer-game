@@ -1,0 +1,49 @@
+/*
+ * ALL styles are scoped under #game-root. We intentionally set NO rules on
+ * html or body (no resets, no overflow/width/height) so we never poison the
+ * arcade host page. #game-root is positioned fixed/inset so it fills its frame
+ * without depending on (or mutating) body margins.
+ */
+
+#game-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #05070d;
+  outline: none;
+  /* Local box model reset — scoped to the game subtree only. */
+  box-sizing: border-box;
+}
+
+#game-root *,
+#game-root *::before,
+#game-root *::after {
+  box-sizing: border-box;
+}
+
+#game-root .game-canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+
+#game-root .start-button {
+  position: absolute;
+  bottom: 12%;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 22px;
+  font: 700 14px/1 monospace;
+  letter-spacing: 0.15em;
+  color: #05070d;
+  background: #e8eefc;
+  border: 2px solid #aab6d6;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#game-root .start-button:hover {
+  background: #ffffff;
+}
