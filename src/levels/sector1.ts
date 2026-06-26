@@ -16,6 +16,7 @@
 
 import { TILE } from '../core/constants';
 import { THEMES } from '../engine/Background';
+import { SKIN_SECTOR1 } from '../game/Player';
 import { PAINT } from '../world/autotiler';
 import { door, flag, waterColumn, cloud, type Placement } from '../world/structures';
 import type { LevelDef } from './types';
@@ -416,11 +417,14 @@ export const sector1: LevelDef = {
   height: SECTOR1_HEIGHT,
   spawn: { x: SECTOR1_SPAWN.x, y: SECTOR1_SPAWN.y },
   theme: THEMES.green, // forest/green (Sector 3 now takes the blue/teal sky)
+  playerSkin: SKIN_SECTOR1,
   paint: SECTOR1_PAINT,
   foregroundPaint: SECTOR1_FOREGROUND_PAINT,
   coins: [...SECTOR1_COINS, ...SIDE_REWARD_COINS],
   diamond: SECTOR1_DIAMOND,
   key: SECTOR1_KEY,
+  // Keyhole block (col 28): carrying the key here spawns the heavy enemy.
+  keyhole: { col: 28, row: 12 },
   checkpoint: SECTOR1_CHECKPOINT,
   exit: { col: SECTOR1_EXIT.col, row: SECTOR1_EXIT.row, hTiles: SECTOR1_EXIT.hTiles },
   spikes: SECTOR1_SPIKES,
@@ -471,6 +475,17 @@ export const sector1: LevelDef = {
       mode: 'oneshot',
       holdTime: SIDE_BUTTON_HOLD,
       targetId: SIDE_BUTTON.targetId,
+    },
+    // Vault lever on the corridor ledge: now the SOLE opener of the vault door
+    // (the key no longer opens it). One hold latches it open.
+    {
+      kind: 'lever',
+      col: SIDE_LEDGE.col,
+      row: SIDE_ROW - 1,
+      mode: 'oneshot',
+      holdTime: 0.25,
+      targetId: SIDE_LOCK.id,
+      effect: 'openDoor',
     },
   ],
   decor: SECTOR1_DECOR,

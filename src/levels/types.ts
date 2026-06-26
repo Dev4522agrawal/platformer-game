@@ -12,6 +12,7 @@
 
 import type { BackgroundTheme } from '../engine/Background';
 import type { Placement } from '../world/structures';
+import type { EnemyKindId } from '../game/enemies/PatrolDrone';
 
 /** A tile-grid coordinate. */
 export interface Cell {
@@ -19,9 +20,14 @@ export interface Cell {
   row: number;
 }
 
-/** A patrol-drone spawn: a column, the surface row its feet rest on, and a facing. */
+/**
+ * A patrol-enemy spawn: a column, the surface row its feet rest on, a facing, and
+ * an optional variant (`small` default, or the larger `large`). The `heavy`
+ * variant is never authored here — it is spawned at runtime from the keyhole.
+ */
 export interface DroneSpec extends Cell {
   dir: 1 | -1;
+  kind?: EnemyKindId;
 }
 
 /** One-way platform skins (dictionary §4.16 wood, §4.17 floating tiles). */
@@ -64,7 +70,15 @@ export type SwitchKind = 'lever' | 'button';
 /** Hold-to-fire behaviour (maps to Interactable's InteractMode). */
 export type SwitchMode = 'oneshot' | 'toggle' | 'momentary';
 
-/** A lever/button that drives one moving platform (via the activatable registry). */
+/** What a switch drives (informational; sets the interact prompt verb). */
+export type SwitchEffect = 'movePlatform' | 'openDoor';
+
+/**
+ * A lever/button driving one target by id via the activatable registry. The
+ * target is a moving platform (`movePlatform`, default) OR a vault door
+ * (`openDoor`): both are registered Activatables, so the lever opening a door
+ * reuses the exact same propagation as the lever raising a lift.
+ */
 export interface SwitchSpec {
   kind: SwitchKind;
   col: number;
@@ -72,6 +86,7 @@ export interface SwitchSpec {
   mode: SwitchMode;
   holdTime: number;
   targetId: string;
+  effect?: SwitchEffect;
 }
 
 /** The sector exit door (kind 'exit'); touching it ends the run. */
@@ -103,6 +118,8 @@ export interface LevelDef {
   readonly spawn: { readonly x: number; readonly y: number };
   /** Per-level backdrop theme (Sector 1 = teal sky, Sector 2 = earthy cave). */
   readonly theme: BackgroundTheme;
+  /** Per-sector player walk-cycle frame pair (Characters atlas ids). */
+  readonly playerSkin: readonly [number, number];
   /** Terrain paint grid (chars '.'/'G'/'S'/'I'/'D') -> autotiler render ids. */
   readonly paint: readonly string[];
   /** Decorative foreground depth paint grid (visual only, no collision). */
@@ -110,6 +127,12 @@ export interface LevelDef {
   readonly coins: ReadonlyArray<Cell>;
   readonly diamond: Cell | null;
   readonly key: Cell | null;
+  /**
+   * The keyhole block cell. While carrying the key, touching it consumes the key
+   * and SPAWNS the heavy enemy here (the key no longer opens any door). Null when
+   * a sector has no keyhole.
+   */
+  readonly keyhole: Cell | null;
   readonly checkpoint: Cell;
   readonly exit: ExitSpec;
   readonly spikes: ReadonlyArray<Cell>;

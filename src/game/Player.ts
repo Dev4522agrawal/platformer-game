@@ -15,14 +15,31 @@ import type { Solid } from './types';
  */
 export const PLAYER_TILE = 0;
 
+/**
+ * Per-sector player walk-cycle frame pairs (Characters atlas ids). The exact
+ * walk-cycle logic is unchanged; only the two frame ids swap per sector, applied
+ * on scene load via the level's `playerSkin`. Isolated here for one-line swaps.
+ */
+export const SKIN_SECTOR1: readonly [number, number] = [0, 1];
+export const SKIN_SECTOR2: readonly [number, number] = [6, 7];
+export const SKIN_SECTOR3: readonly [number, number] = [2, 3];
+
 const PLAYER_W = 12;
 const PLAYER_H = 16;
 
 /** Downward speed above which a landing counts as a hard impact (camera shake). */
 const LANDING_IMPACT_VY = 450;
 
-/** Lives a fresh run starts with. */
+/** Lives a fresh run starts with (= 3 full hearts = 6 half-hearts). */
 export const START_LIVES = 3;
+
+/**
+ * Damage tiers, in HEARTS. Small hazards (spikes, the small/large patrol enemies)
+ * deal half a heart; a pit-fall and the heavy enemy deal a full heart. Lives are
+ * fractional (see takeDamage); the HUD renders full/half/empty heart tiles.
+ */
+export const DAMAGE_SMALL = 0.5;
+export const DAMAGE_FULL = 1.0;
 
 /** Seconds of damage-immunity granted after a hit (sprite blinks for this long). */
 export const IFRAME_SECONDS = 1.5;
@@ -69,17 +86,11 @@ export class Player extends Entity {
   private holdBoostActive = false;
   private apexHangTimer = 0;
 
-  /** Colour base id; walk frames are [base, base+1]. Derived from PLAYER_TILE. */
-  private readonly base = PLAYER_TILE;
-  private readonly walkAnim = new SpriteAnimator(
-    [
-      { id: PLAYER_TILE, duration: 8 },
-      { id: PLAYER_TILE + 1, duration: 8 },
-    ],
-    true,
-  );
+  /** Idle/base frame; walk frames are the two-id skin pair (per sector). */
+  private readonly base: number;
+  private readonly walkAnim: SpriteAnimator;
   /** Tile id chosen each update for rendering (walk frame or idle base). */
-  private renderId = PLAYER_TILE;
+  private renderId: number;
 
   /**
    * One-shot: true only on the frame the player lands from a hard fall
@@ -98,6 +109,7 @@ export class Player extends Entity {
     private readonly sheet: TileSource,
     private readonly map: Tilemap,
     private readonly input: Input,
+    walkFrames: readonly [number, number] = SKIN_SECTOR1,
   ) {
     super();
     this.respawnX = spawnX;
@@ -106,6 +118,16 @@ export class Player extends Entity {
     this.y = this.prevY = spawnY;
     this.w = PLAYER_W;
     this.h = PLAYER_H;
+    // Per-sector skin: same walk-cycle timing (8 steps/frame), different ids.
+    this.base = walkFrames[0];
+    this.renderId = walkFrames[0];
+    this.walkAnim = new SpriteAnimator(
+      [
+        { id: walkFrames[0], duration: 8 },
+        { id: walkFrames[1], duration: 8 },
+      ],
+      true,
+    );
   }
 
   /** Box center, in world px (for camera follow and contact tests). */
@@ -144,6 +166,15 @@ export class Player extends Entity {
     this.lives = Math.max(0, this.lives - amount);
     this.iframeTimer = IFRAME_SECONDS;
     return this.lives <= 0;
+  }
+
+  /**
+   * Open the post-hit invulnerability window WITHOUT taking damage — used when an
+   * enemy is spawned on top of the player (the keyhole heavy enemy) so the spawn
+   * isn't an instant, unavoidable hit. Reuses the same blink/i-frame timing.
+   */
+  grantInvulnerability(): void {
+    this.iframeTimer = IFRAME_SECONDS;
   }
 
   /**

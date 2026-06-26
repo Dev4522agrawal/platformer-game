@@ -21,6 +21,7 @@
 
 import { TILE } from '../core/constants';
 import { THEMES } from '../engine/Background';
+import { SKIN_SECTOR2 } from '../game/Player';
 import { PAINT } from '../world/autotiler';
 import { door, flag, waterColumn, cloud, type Placement } from '../world/structures';
 import type {
@@ -123,6 +124,9 @@ const SPIKES: ReadonlyArray<Cell> = [
  */
 const DRONES: ReadonlyArray<DroneSpec> = [
   { col: 8, row: GROUND_TOP, dir: 1 }, // chamber 1 (hemmed by the mouth wall + pit 1)
+  // Larger patrol enemy (18/19) pacing the long flat past the checkpoint — bigger
+  // hitbox raises the difficulty; still stompable / jump-past-able.
+  { col: 30, row: GROUND_TOP, dir: 1, kind: 'large' },
   { col: 41, row: GROUND_TOP, dir: -1 }, // mid chamber (hemmed by pit 2 + pit 3)
 ];
 
@@ -215,12 +219,21 @@ const SKY_DECOR: ReadonlyArray<Placement> = [
 ];
 
 // --- switches & moving platforms ------------------------------------------
-// Sector 2 keeps the critical path self-contained (no switch-gated criticals),
-// so it authors no levers/lifts; the falling platform above is the only timed
-// beat. These arrays stay empty but typed for the shared LevelDef shape.
+// No moving lifts. The ONE switch is the vault lever (on the corridor ledge):
+// it is now the SOLE opener of the vault door (the key no longer opens it).
 
 const MOVING: ReadonlyArray<MovingSpec> = [];
-const SWITCHES: ReadonlyArray<SwitchSpec> = [];
+const SWITCHES: ReadonlyArray<SwitchSpec> = [
+  {
+    kind: 'lever',
+    col: 45, // on the wood landing ledge beside the vault door
+    row: VAULT_ROW - 1,
+    mode: 'oneshot',
+    holdTime: 0.25,
+    targetId: VAULT_LOCK.id,
+    effect: 'openDoor',
+  },
+];
 
 // --- derived terrain ------------------------------------------------------
 
@@ -315,11 +328,14 @@ export const sector2: LevelDef = {
   height: SECTOR2_HEIGHT,
   spawn: { x: SECTOR2_SPAWN.x, y: SECTOR2_SPAWN.y },
   theme: THEMES.orange, // earthy/underground — distinct from Sector 1's teal sky
+  playerSkin: SKIN_SECTOR2,
   paint: SECTOR2_PAINT,
   foregroundPaint: SECTOR2_FOREGROUND_PAINT,
   coins: COINS,
   diamond: DIAMOND,
   key: KEY,
+  // Keyhole block (col 16): carrying the key here spawns the heavy enemy.
+  keyhole: { col: 16, row: SURFACE_ROW },
   checkpoint: CHECKPOINT,
   exit: { col: EXIT.col, row: EXIT.row, hTiles: EXIT.hTiles },
   spikes: SPIKES,

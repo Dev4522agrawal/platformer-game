@@ -11,7 +11,7 @@ import { Background } from '../engine/Background';
 import { EntityManager } from '../engine/EntityManager';
 import { ParticlePool, type RGB } from '../engine/ParticlePool';
 import { drawAtlas } from '../engine/DebugAtlas';
-import { Player, START_LIVES } from '../game/Player';
+import { Player, START_LIVES, DAMAGE_SMALL, DAMAGE_FULL } from '../game/Player';
 import { Collectible } from '../game/Collectible';
 import { Checkpoint } from '../game/Checkpoint';
 import {
@@ -31,6 +31,8 @@ import {
   STOMP_MIN_FALL_VY,
   STOMP_BOUNCE_VY,
   STOMP_TOP_BAND,
+  ENEMY_KINDS,
+  HEAVY_DRONE,
 } from '../game/enemies/PatrolDrone';
 import { drawHud, drawControlLegend, drawInteractHint } from '../game/Hud';
 import { Interactable, LEVER_TILE, BUTTON_TILE } from '../game/Interactable';
@@ -45,7 +47,7 @@ import { TileRenderer } from '../world/tilemapRenderer';
 import type { Placement } from '../world/structures';
 import { COIN_ID, DIAMOND_ID, KEY_ID } from '../levels/sector1';
 import { LEVELS, resolveLevelKey, nextLevelKey, DEFAULT_LEVEL, type LevelKey } from '../levels';
-import type { LevelDef, OneWayArt } from '../levels/types';
+import type { Cell, LevelDef, OneWayArt } from '../levels/types';
 
 /** One-way platform skins (dictionary §4.16 wood, §4.17 floating tiles). */
 const WOOD_ART: PlatformArt = { left: 47, center: 48, right: 50, surfaceInset: 0 };
@@ -71,7 +73,6 @@ const COLLECT_COLOR: RGB = { r: 90, g: 230, b: 255 }; // cyan
 const CHECKPOINT_COLOR: RGB = { r: 110, g: 240, b: 130 }; // green
 const KEY_COLOR: RGB = { r: 245, g: 215, b: 90 }; // gold
 const DRONE_COLOR: RGB = { r: 255, g: 90, b: 90 }; // red (matches the drone sprite)
-const DOOR_COLOR: RGB = { r: 200, g: 160, b: 255 }; // violet
 
 /**
  * Screen-space layout for the persisted best-score readout. Positions are in the
@@ -167,6 +168,10 @@ export class Game {
   private spikes: Spike[] = [];
   private drones: PatrolDrone[] = [];
   private checkpoint: Checkpoint | null = null;
+  // The keyhole block cell for this scene (heavy-enemy spawn point), and a guard
+  // so the key spawns it exactly once per scene.
+  private keyholeCell: Cell | null = null;
+  private keySpawned = false;
   private collectedCount = 0;
   private prevKeyK = false;
 
@@ -176,6 +181,9 @@ export class Game {
   private diamond: Collectible | null = null;
   private coinCount = 0;
   private diamondCount = 0;
+  // Run-level points from enemy stomps; carried across sectors like coinCount and
+  // folded into every score computation (live HUD, end tally, ARCADE_SCORE).
+  private killPoints = 0;
   private elapsedSeconds = 0;
   private completed = false;
   private result: RunResult | null = null;
@@ -427,6 +435,27 @@ export class Game {
       }
     }
 
+    // Keyhole block: the key no longer opens doors — carrying it to the keyhole
+    // CONSUMES it and SPAWNS the heavy enemy from the (previously decorative) block.
+    // Guarded to fire once per scene; the spawned enemy joins the normal patrol/
+    // stomp/reset path (so a respawn revives it) and is cleared on scene unload.
+    const kh = this.keyholeCell;
+    if (kh && player.heldKey && !this.keySpawned && this.characterTiles) {
+      const block = { x: kh.col * TILE, y: kh.row * TILE, w: TILE, h: TILE };
+      if (overlaps(player, block)) {
+        this.keySpawned = true;
+        player.heldKey = false;
+        // Feet rest on the row below the keyhole block (the walking surface).
+        const heavy = new PatrolDrone(this.characterTiles, this.tilemap, kh.col, kh.row + 1, -1, HEAVY_DRONE);
+        this.entities.add(heavy);
+        this.drones.push(heavy);
+        this.particles.spawnBurst(block.x + TILE / 2, block.y + TILE / 2, DRONE_COLOR, 18);
+        // It spawns onto the player (who is touching the block) — grant the blink
+        // window so the spawn isn't an instant hit (a stomp is still allowed).
+        player.grantInvulnerability();
+      }
+    }
+
     // Spike traps: damage TRIGGERS, never solid. Skip entirely while invulnerable
     // so the player passes harmlessly during the post-hit blink; otherwise the
     // first overlap deals one point and (if non-fatal) respawns at checkpoint via
@@ -434,7 +463,7 @@ export class Game {
     if (!player.invulnerable) {
       for (const s of this.spikes) {
         if (!overlaps(player, s)) continue;
-        if (player.takeDamage(1, 'spike')) {
+        if (player.takeDamage(DAMAGE_SMALL, 'spike')) {
           this.endRun('gameover');
           return;
         }
@@ -459,12 +488,13 @@ export class Game {
         drone.kill();
         this.particles.spawnBurst(drone.x + drone.w / 2, drone.y + drone.h / 2, DRONE_COLOR, 14);
         player.bounce(STOMP_BOUNCE_VY);
-        // TODO(score): award points for a drone stomp via the existing counters.
+        // Kill points flow through the same score the HUD/end-tally/ARCADE_SCORE read.
+        this.killPoints += drone.kind.killPoints;
         continue;
       }
 
       if (!player.invulnerable) {
-        if (player.takeDamage(1, 'drone')) {
+        if (player.takeDamage(drone.kind.contactDamage, 'drone')) {
           this.endRun('gameover');
           return;
         }
@@ -479,7 +509,7 @@ export class Game {
     // granted. A fall during i-frames is ignored for life-loss but still respawns
     // (no free death-spiral). The held key is NOT cleared (only a door consumes it).
     if (player.y > this.tilemap.pixelHeight) {
-      if (player.takeDamage(1, 'pit')) {
+      if (player.takeDamage(DAMAGE_FULL, 'pit')) {
         this.endRun('gameover');
         return;
       }
@@ -509,11 +539,12 @@ export class Game {
   }
 
   /**
-   * Per-door contact effects the door can't do on its own: a locked door opens
-   * (and consumes the key) when the player touches it carrying one; an exit door
-   * fires the sector-complete trigger. A 2px pad lets a player standing flush
-   * against a closed door still register the touch. Returns true ONLY when an
-   * exit door was reached, so the caller stops processing the rest of the step.
+   * Per-door contact the door can't do on its own: the exit door fires the
+   * sector-complete trigger on touch. Vault doors are NO LONGER key-opened — the
+   * lever is their sole opener (via setActive through the activatable registry),
+   * so the key consumes nothing here. A 2px pad lets a player standing flush
+   * against the door still register the touch. Returns true ONLY when an exit door
+   * was reached, so the caller stops processing the rest of the step.
    */
   private handleDoorContact(door: Door, player: Player): boolean {
     const pad = 2;
@@ -524,11 +555,7 @@ export class Game {
       player.y + player.h > door.y - pad;
     if (!near) return false;
 
-    if (door.kind === 'locked' && player.heldKey && door.unlock()) {
-      player.heldKey = false;
-      this.particles?.spawnBurst(door.x + door.w / 2, door.y + door.h / 2, DOOR_COLOR, 16);
-      return false;
-    } else if (door.kind === 'exit') {
+    if (door.kind === 'exit') {
       this.onExit();
       return true;
     }
@@ -597,6 +624,7 @@ export class Game {
       this.diamondCount,
       this.elapsedSeconds,
       includeTimeBonus,
+      this.killPoints,
     );
     this.result = result;
 
@@ -619,6 +647,7 @@ export class Game {
       outcome,
       coins: result.coins,
       diamonds: result.diamonds,
+      killPoints: result.killPoints,
       timeSeconds: Math.floor(result.elapsedSeconds),
       timeBonus: result.timeBonus,
       sector: this.currentSector,
@@ -666,6 +695,7 @@ export class Game {
       this.runLives = START_LIVES;
       this.coinCount = 0;
       this.diamondCount = 0;
+      this.killPoints = 0;
       this.elapsedSeconds = 0;
       this.collectedCount = 0;
     }
@@ -675,8 +705,12 @@ export class Game {
     // as loose tiles. Terrain + decor render through the loose TileRenderer.
     const [tilesBitmap, characterTiles, backgroundTiles] = await Promise.all([
       loadImageBitmap('assets/kenney/base/Tilemap/tilemap_packed.png'),
-      // 0-7 back the player; 15/16 are the patrol-drone walk frames (placeholder).
-      LooseTileSet.load('assets/kenney/base/Tiles/Characters', [0, 1, 2, 3, 4, 5, 6, 7, 15, 16]),
+      // 0-7 back the per-sector player skins; 15-23 are the enemy walk/defeated
+      // frames (small 15/16/17, large 18/19/20, heavy 21/22/23 — all placeholders).
+      LooseTileSet.load(
+        'assets/kenney/base/Tiles/Characters',
+        [0, 1, 2, 3, 4, 5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+      ),
       LooseTileSet.load(
         'assets/kenney/base/Tiles/Backgrounds',
         Array.from({ length: 24 }, (_, i) => i),
@@ -717,6 +751,7 @@ export class Game {
       characterTiles,
       tilemap,
       this.input!,
+      level.playerSkin,
     );
     // Apply the run-level lives carry: START_LIVES on a fresh run, or the count
     // carried from the previous sector on a transition.
@@ -762,7 +797,7 @@ export class Game {
     // They hold the tilemap for their own wall/ledge turn tests.
     const drones: PatrolDrone[] = [];
     for (const d of level.drones) {
-      const drone = new PatrolDrone(characterTiles, tilemap, d.col, d.row, d.dir);
+      const drone = new PatrolDrone(characterTiles, tilemap, d.col, d.row, d.dir, ENEMY_KINDS[d.kind ?? 'small']);
       entities.add(drone);
       drones.push(drone);
     }
@@ -815,8 +850,10 @@ export class Game {
       );
     }
 
-    // Doors: the exit (never solid; touching it completes the sector) + any
-    // key-locked doors (closed solids until the held key opens them).
+    // Doors: the exit (never solid; touching it completes the sector) + any vault
+    // doors. Vault doors are now 'permanent' (closed solids opened by a LEVER via
+    // the activatable registry — the key no longer opens them), so each registers
+    // under its id alongside the moving platforms for the switch to drive.
     const doors: Door[] = [
       new Door(
         tileSheet,
@@ -829,9 +866,17 @@ export class Game {
       ),
     ];
     for (const ld of level.lockedDoors) {
-      doors.push(
-        new Door(tileSheet, DOOR_CLOSED_TILE, ld.id, 'locked', ld.col * TILE, ld.row * TILE, ld.hTiles),
+      const vault = new Door(
+        tileSheet,
+        DOOR_CLOSED_TILE,
+        ld.id,
+        'permanent',
+        ld.col * TILE,
+        ld.row * TILE,
+        ld.hTiles,
       );
+      doors.push(vault);
+      registry.set(vault.id, vault);
     }
 
     // Switches -> their targets, via the activatable registry (lever/button skin).
@@ -846,7 +891,7 @@ export class Game {
           sw.row * TILE,
           sw.mode,
           sw.holdTime,
-          'movePlatform',
+          sw.effect ?? 'movePlatform',
           [sw.targetId],
           registry,
         ),
@@ -888,6 +933,8 @@ export class Game {
     this.spikes = spikes;
     this.drones = drones;
     this.checkpoint = checkpoint;
+    this.keyholeCell = level.keyhole;
+    this.keySpawned = false;
     this.diamond = diamond;
     this.currentSector = level.sector;
     this.currentLevelKey = key;
@@ -929,6 +976,8 @@ export class Game {
     this.spikes = [];
     this.drones = [];
     this.checkpoint = null;
+    this.keyholeCell = null;
+    this.keySpawned = false;
     this.diamond = null;
     // NOTE: run-level counters (coinCount/diamondCount/elapsedSeconds/
     // collectedCount/runLives) are deliberately NOT cleared here — a sector
@@ -1083,7 +1132,13 @@ export class Game {
     if (!this.player || !this.tileSheet || !this.canvas) return;
     // Live pickup score (coins+diamond, no time bonus): updates as collected,
     // reusing the scoring module rather than holding a separate field.
-    const score = computeScore(this.coinCount, this.diamondCount, this.elapsedSeconds, false).score;
+    const score = computeScore(
+      this.coinCount,
+      this.diamondCount,
+      this.elapsedSeconds,
+      false,
+      this.killPoints,
+    ).score;
     drawHud(ctx, this.tileSheet, this.canvas.width, {
       lives: this.player.lives,
       maxLives: START_LIVES,
@@ -1137,6 +1192,7 @@ export class Game {
       const rows = [
         `COINS    ${r.coins} x ${COIN_POINTS}`,
         `DIAMOND  ${r.diamonds} x ${DIAMOND_POINTS}`,
+        `ENEMIES  +${r.killPoints}`,
         `TIME     ${Math.floor(r.elapsedSeconds)}s  (+${r.timeBonus})`,
       ];
       for (let i = 0; i < rows.length; i++) {
