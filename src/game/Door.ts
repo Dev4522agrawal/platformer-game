@@ -1,10 +1,15 @@
 import { Entity } from '../engine/Entity';
 import { TILE } from '../core/constants';
 import type { TileSource } from '../engine/TileSource';
+import { DOOR_TOP_TILE, DOOR_BOTTOM_PLAIN_TILE } from '../world/structures';
 import type { Activatable, Solid } from './types';
 
-/** Door tile id on the terrain packed sheet (confirm via the G atlas). */
-export const DOOR_CLOSED_TILE = 150;
+/**
+ * Closed-door BOTTOM tile (TILE_DICTIONARY §4.13). A rendered door is never a
+ * slab: it is the 110 top over this bottom (see render()). Sourced from the door
+ * macro's ids so there is one definition of the door recipe.
+ */
+export const DOOR_CLOSED_TILE = DOOR_BOTTOM_PLAIN_TILE;
 
 export type DoorKind = 'locked' | 'timed' | 'permanent' | 'exit';
 
@@ -115,12 +120,24 @@ export class Door extends Entity implements Activatable, Solid {
       // Gentle pulse so the goal reads as interactive.
       ctx.save();
       ctx.globalAlpha = 0.6 + 0.35 * (0.5 + 0.5 * Math.sin(this.pulse));
-      for (let r = 0; r < rows; r++) this.source.draw(ctx, this.closedTile, dx, dyTop + r * TILE);
+      this.drawClosed(ctx, dx, dyTop, rows);
       ctx.restore();
       return;
     }
 
     if (this.open) return; // open: render nothing
-    for (let r = 0; r < rows; r++) this.source.draw(ctx, this.closedTile, dx, dyTop + r * TILE);
+    this.drawClosed(ctx, dx, dyTop, rows);
+  }
+
+  /**
+   * Draw a closed door per the dictionary (§4.13): a 110 top over the bottom
+   * tile (150 plain / 130 windowed), never a stack of identical slabs. Any rows
+   * beyond two repeat the bottom tile.
+   */
+  private drawClosed(ctx: CanvasRenderingContext2D, dx: number, dyTop: number, rows: number): void {
+    for (let r = 0; r < rows; r++) {
+      const id = r === 0 ? DOOR_TOP_TILE : this.closedTile;
+      this.source.draw(ctx, id, dx, dyTop + r * TILE);
+    }
   }
 }

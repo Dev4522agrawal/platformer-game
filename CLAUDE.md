@@ -10,7 +10,7 @@
 
 No framework. No game engine (no Phaser). No external runtime libraries.
 
-Using **Kenney Pixel Platformer (Base)** + **Pixel Platformer Industrial Expansion** (CC0).
+Using **Kenney Pixel Platformer (Base)** (CC0).
 
 This game is **one tenant (~10% of effort) inside the Interactive Intelligence Arcade**, embedded
 as an iframe at the sub-path `/sector-runner/`. The goal is the **smallest version that still
@@ -44,6 +44,21 @@ it and every integration was a retrofit. Every change must keep ALL of these tru
    FIT-scaled to `#game-root` (DPR-aware, ResizeObserver). No fixed pixel box.
 
 Before finishing any change, self-check it against this list.
+
+### Tile usage — the dictionary is the only source of tile ids
+
+Every tile placed in a level, entity, or macro MUST come from the tile dictionary —
+`TILE_DICTIONARY.md` (prose) + `src/data/tileMeta.json` (machine-readable) — via the structure
+macros in `src/world/structures.ts` (`door` / `flag` / `waterColumn` / `cloud`) or the documented
+ids and edge data. NEVER hand-place a raw guessed tile id.
+
+- Multi-tile objects (doors = 110 + 130/150, trees, pipes, etc.) use their macro/recipe, never a
+  single slab tile.
+- Any tile with an entry in `tileMeta.animationPairs` (coins 151/152, flag 111/112, button
+  148/149, water 33/53 + waterfall pairs) MUST animate via the TileAnimator, never render as a
+  static frame.
+- Before placing any tile, read its dictionary entry. If a tile or composition you need isn't in
+  the dictionary, flag it — don't improvise an id.
 
 ---
 
@@ -135,7 +150,7 @@ Build in this sequence; **movement is verified in the test room before any level
 6. Hazards + damage/lives/respawn
 7. Enemies: Patrol Drone + Hover Drone
 8. Sector 1 (Nature) + tutorial flow
-9. Sector 2 (Industrial) + chain/lever skins
+9. Sector 2 (Cavern) 
 10. Boss (single arena, 3 attacks, numbered-tile HP) + Sector 5 approach
 11. Scoring + HUD + end screens
 12. Menus (robot select, pause, game over) + localStorage save

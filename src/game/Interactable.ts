@@ -1,12 +1,17 @@
 import { Entity } from '../engine/Entity';
 import { TILE } from '../core/constants';
 import type { TileSource } from '../engine/TileSource';
+import { animationFramesFor } from '../engine/TileAnimator';
 import type { Activatable } from './types';
 import type { Player } from './Player';
 
-/** Switch skin tile ids on the terrain packed sheet (confirm via the G atlas). */
-export const LEVER_TILE = 109;
-export const BUTTON_TILE = 151;
+/**
+ * Switch skin tile ids (dictionary §4.18 / §4.19). LEVER is the neutral state of
+ * the 3-state lever (64 left / 65 neutral / 66 right). BUTTON is the pressure
+ * button (148 unpressed / 149 pressed). CHAIN is a Sector-2 placeholder.
+ */
+export const LEVER_TILE = 65;
+export const BUTTON_TILE = 148;
 export const CHAIN_TILE = 109; // placeholder; real industrial chain arrives in Sector 2
 
 /** How long the player must hold the interact key, per skin string. */
@@ -16,6 +21,16 @@ export type InteractEffect = 'openDoor' | 'movePlatform' | 'toggleState';
 
 /** How close (in px) the player must be for the switch to be in range. */
 const RANGE_PAD = TILE;
+
+/**
+ * Verb shown in the contextual interact prompt, per effect — so any interactable
+ * surfaces the right action without hardcoding a specific switch.
+ */
+const PROMPT_VERB: Record<InteractEffect, string> = {
+  openDoor: 'open door',
+  movePlatform: 'activate platform',
+  toggleState: 'flip switch',
+};
 
 /**
  * One class covers levers, buttons and chains. The behaviour is driven by
@@ -66,6 +81,21 @@ export class Interactable extends Entity {
     this.y = this.prevY = y;
     this.w = TILE;
     this.h = TILE;
+  }
+
+  /**
+   * Whether a contextual "press X" prompt should show now: the player is in
+   * range AND the switch can still do something (a spent oneshot is silent).
+   */
+  wantsPrompt(player: Player): boolean {
+    if (!this.inRange(player)) return false;
+    if (this.mode === 'oneshot' && this.fired) return false; // already activated
+    return true;
+  }
+
+  /** Human verb for the interact prompt (derived from the effect, not hardcoded). */
+  get promptVerb(): string {
+    return PROMPT_VERB[this.effect];
   }
 
   /** Player AABB within ~1 tile AND grounded. */
@@ -130,7 +160,13 @@ export class Interactable extends Entity {
     const { x, y } = this.drawPos(alpha);
     const dx = Math.round(x - camX);
     const dy = Math.round(y - camY);
-    this.source.draw(ctx, this.skin, dx, dy);
+    // Skins with a dictionary animation pair (e.g. button 148 up / 149 pressed)
+    // show their pressed frame while engaged or latched on; a pair-less skin
+    // (e.g. the lever's 65) just draws itself.
+    const frames = animationFramesFor(this.skin);
+    const pressed = this.active || this.holdTimer > 0;
+    const id = pressed && frames.length > 1 ? frames[1] : frames[0];
+    this.source.draw(ctx, id, dx, dy);
 
     // "Light on" pixel when active.
     if (this.active) {

@@ -7,74 +7,83 @@ import { LooseTileSet } from '../engine/LooseTileSet';
 import type { TileSource } from '../engine/TileSource';
 import { Tilemap, type TilemapData } from '../engine/Tilemap';
 import { Camera } from '../engine/Camera';
-import { Background, THEMES } from '../engine/Background';
+import { Background } from '../engine/Background';
 import { EntityManager } from '../engine/EntityManager';
 import { ParticlePool, type RGB } from '../engine/ParticlePool';
 import { drawAtlas } from '../engine/DebugAtlas';
-import { Player } from '../game/Player';
+import { Player, START_LIVES } from '../game/Player';
 import { Collectible } from '../game/Collectible';
 import { Checkpoint } from '../game/Checkpoint';
 import {
   Platform,
   MovingPlatform,
-  FallingPlatform,
   CloudPlatform,
+  FallingPlatform,
   MOVING_ART,
   FALLING_ART,
-  CLOUD_ART,
+  type PlatformArt,
 } from '../game/Platform';
-import { Door, DOOR_CLOSED_TILE, type DoorKind } from '../game/Door';
+import { Door, DOOR_CLOSED_TILE } from '../game/Door';
 import { Key } from '../game/Key';
+import { Spike } from '../game/Hazard';
 import {
-  Interactable,
-  LEVER_TILE,
-  BUTTON_TILE,
-  CHAIN_TILE,
-  type InteractMode,
-  type InteractEffect,
-} from '../game/Interactable';
+  PatrolDrone,
+  STOMP_MIN_FALL_VY,
+  STOMP_BOUNCE_VY,
+  STOMP_TOP_BAND,
+} from '../game/enemies/PatrolDrone';
+import { drawHud, drawControlLegend, drawInteractHint } from '../game/Hud';
+import { Interactable, LEVER_TILE, BUTTON_TILE } from '../game/Interactable';
+import { animatedTileId, animationFramesFor } from '../engine/TileAnimator';
+import { computeScore, COIN_POINTS, DIAMOND_POINTS, type RunResult } from '../game/score';
+import { dispatchScore } from '../platform/score';
+import { loadBestScore, saveBestScore } from '../platform/storage';
 import type { Activatable, Solid } from '../game/types';
 import { DEFAULT_MOVEMENT } from '../game/movementConfig';
-import testRoom from '../levels/test_room.json';
+import { autotile, PAINT } from '../world/autotiler';
+import { TileRenderer } from '../world/tilemapRenderer';
+import type { Placement } from '../world/structures';
+import { COIN_ID, DIAMOND_ID, KEY_ID } from '../levels/sector1';
+import { LEVELS, resolveLevelKey, nextLevelKey, DEFAULT_LEVEL, type LevelKey } from '../levels';
+import type { LevelDef, OneWayArt } from '../levels/types';
+
+/** One-way platform skins (dictionary §4.16 wood, §4.17 floating tiles). */
+const WOOD_ART: PlatformArt = { left: 47, center: 48, right: 50, surfaceInset: 0 };
+const FLOAT_ART_PLAIN: PlatformArt = { left: 146, center: 146, right: 146, surfaceInset: 0 };
+const FLOAT_ART_DIRT: PlatformArt = { left: 147, center: 147, right: 147, surfaceInset: 0 };
+
+/** Map a level's one-way platform skin tag to its concrete L/C/R art. */
+const ONE_WAY_ART: Record<OneWayArt, PlatformArt> = {
+  wood: WOOD_ART,
+  floatPlain: FLOAT_ART_PLAIN,
+  floatDirt: FLOAT_ART_DIRT,
+};
 
 /**
- * A spawn entry in a level's "entities" array. Platform/door/interactable
- * entries carry extra optional fields beyond the base tile position.
+ * Decorative foreground depth pass. Land masses scroll slightly FASTER than the
+ * camera (reads as closer) and are nudged down so they hug the bottom edge.
+ * Purely visual — no collision. Tune or remove the render block to toggle it.
  */
-interface LevelEntity {
-  type: string;
-  tx: number;
-  ty: number;
-  kind?: string;
-  wTiles?: number;
-  tx2?: number;
-  ty2?: number;
-  speed?: number;
-  controlled?: boolean;
-  id?: string;
-  hTiles?: number;
-  duration?: number;
-  skin?: string;
-  mode?: string;
-  holdTime?: number;
-  effect?: string;
-  targets?: string[];
-}
+const FOREGROUND_PARALLAX = 1.15;
+const FOREGROUND_Y_OFFSET = 8;
 
 const COLLECT_COLOR: RGB = { r: 90, g: 230, b: 255 }; // cyan
 const CHECKPOINT_COLOR: RGB = { r: 110, g: 240, b: 130 }; // green
 const KEY_COLOR: RGB = { r: 245, g: 215, b: 90 }; // gold
+const DRONE_COLOR: RGB = { r: 255, g: 90, b: 90 }; // red (matches the drone sprite)
 const DOOR_COLOR: RGB = { r: 200, g: 160, b: 255 }; // violet
 
-/** Switch skin string -> terrain tile id. */
-const SKIN_TILES: Record<string, number> = {
-  lever: LEVER_TILE,
-  button: BUTTON_TILE,
-  chain: CHAIN_TILE,
-};
-
-/** Seconds the "SECTOR COMPLETE" overlay shows before the scene reloads. */
-const EXIT_RELOAD_DELAY = 1.5;
+/**
+ * Screen-space layout for the persisted best-score readout. Positions are in the
+ * 480×270 buffer's coordinates; the COMPLETE/GAME_OVER values sit just under each
+ * screen's score line, the MENU value under the title.
+ */
+const BEST_MENU_Y = 270 / 2 + 18;
+const BEST_COMPLETE_Y = 196; // under the COMPLETE "SCORE" line (y=176)
+const BEST_GAMEOVER_Y = 270 / 2 + 26; // under the GAME OVER "SCORE" line
+const NEW_BEST_DY = 16; // gap from the BEST line to the "NEW BEST!" flourish
+const BEST_COLOR = '#ffd86b'; // gold, distinct from the green SCORE
+const NEW_BEST_COLOR = '#9effa0';
 
 /** AABB overlap test for contact pickups. */
 function overlaps(
@@ -84,8 +93,16 @@ function overlaps(
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
-/** High-level lifecycle states. */
-export type GameState = 'MENU' | 'PLAYING' | 'PAUSED';
+/**
+ * High-level lifecycle states. TRANSITION is the brief seam between a cleared
+ * non-final sector and the next one loading: the loop is stopped and run-state is
+ * carried, but the run has NOT ended (no score fired). It is deliberately NOT the
+ * COMPLETE tally screen, which is reserved for the final sector's run-end.
+ */
+export type GameState = 'MENU' | 'PLAYING' | 'PAUSED' | 'TRANSITION' | 'COMPLETE' | 'GAME_OVER';
+
+/** How a run ended: cleared the sector, or ran out of lives. */
+export type RunOutcome = 'complete' | 'gameover';
 
 /** Serializable snapshot handed to the host / save system. */
 export interface GameSnapshot {
@@ -129,6 +146,12 @@ export class Game {
   // Active scene (null until loadTestScene resolves; nulled by unloadScene).
   private tileSheet: SpriteSheet | null = null;
   private characterTiles: TileSource | null = null;
+  // Terrain + decor render through the paint-grid autotiler (loose tiles).
+  private terrain: TileRenderer | null = null;
+  private terrainGrid: number[][] = [];
+  private foregroundGrid: number[][] = [];
+  private decor: readonly Placement[] = [];
+  private skyDecor: readonly Placement[] = [];
   private backgroundTiles: TileSource | null = null;
   private background: Background | null = null;
   private tilemap: Tilemap | null = null;
@@ -141,14 +164,34 @@ export class Game {
   private doors: Door[] = [];
   private interactables: Interactable[] = [];
   private keys: Key[] = [];
+  private spikes: Spike[] = [];
+  private drones: PatrolDrone[] = [];
   private checkpoint: Checkpoint | null = null;
   private collectedCount = 0;
   private prevKeyK = false;
 
-  // Exit/sector-complete flow: overlay shown, then the scene reloads.
-  private sectorComplete = false;
-  private exitReloadTimer = 0;
-  private reloading = false;
+  // Run scoring: the diamond is tracked apart from coins; elapsed time runs from
+  // scene load to the exit door. `completed` guards a single score dispatch, and
+  // `result` holds the final tally for the COMPLETE tally screen.
+  private diamond: Collectible | null = null;
+  private coinCount = 0;
+  private diamondCount = 0;
+  private elapsedSeconds = 0;
+  private completed = false;
+  private result: RunResult | null = null;
+  // Which sector is loaded (drives the score snapshot + ARCADE_SCORE envelope).
+  private currentSector = 1;
+  // The registry key of the loaded sector, used to resolve `next` on exit.
+  private currentLevelKey: LevelKey = DEFAULT_LEVEL;
+  // RUN-LEVEL lives carried ACROSS sectors. A fresh run resets this to
+  // START_LIVES (see loadScene's fresh-run branch); a sector transition captures
+  // the live Player.lives into it so the next scene's Player inherits it. During
+  // play the authoritative count is Player.lives — this is the carry slot.
+  private runLives = START_LIVES;
+  // Persisted best across runs (read once on init); `newBest` flags whether the
+  // run that just ended beat it, driving the end-screen "NEW BEST!" flourish.
+  private bestScore = 0;
+  private newBest = false;
 
   private volume = 1;
   private snapshot: GameSnapshot = { score: 0, sector: 0, completion: 0 };
@@ -170,6 +213,10 @@ export class Game {
    */
   init(container: HTMLElement): void {
     this.container = container;
+
+    // Read the persisted best ONCE at init so the menu (and later end screens)
+    // always have a target without touching storage on any per-frame path.
+    this.bestScore = loadBestScore();
 
     this.canvas = new Canvas(container);
     this.canvas.observe();
@@ -198,7 +245,9 @@ export class Game {
     this.container.focus();
     this.renderLoading();
 
-    await this.loadTestScene();
+    // Fresh run from the menu: carry = false resets all run-state (score/coins/
+    // time/lives) to defaults. This is the unambiguous "clean slate" boundary.
+    await this.loadScene(resolveLevelKey(window.location.search), false);
     if (this.state !== 'PLAYING') return;
 
     this.startLoop();
@@ -224,6 +273,7 @@ export class Game {
     this.state = 'MENU';
     this.stopLoop();
     this.unloadScene();
+    this.snapshot = { score: 0, sector: 0, completion: 0 };
     this.showStartButton();
     this.renderMenu();
   }
@@ -301,20 +351,20 @@ export class Game {
 
     this.render(this.accumulator / FIXED_STEP);
 
-    this.rafId = requestAnimationFrame(this.loop);
+    // Only keep the loop alive while playing. An exit-door completion flips the
+    // state to COMPLETE mid-tick and stops the loop; this prevents a stray
+    // reschedule from restarting it.
+    if (this.state === 'PLAYING') {
+      this.rafId = requestAnimationFrame(this.loop);
+    }
   }
 
   private update(dt: number): void {
     if (this.state !== 'PLAYING') return;
-
-    // Sector-complete: freeze the world, show the overlay, then reload.
-    if (this.sectorComplete) {
-      this.exitReloadTimer -= dt;
-      if (this.exitReloadTimer <= 0) void this.reloadScene();
-      return;
-    }
-
     if (!this.player || !this.tilemap || !this.camera || !this.entities || !this.particles) return;
+
+    // Run timer: counts from scene load until the exit door completes the sector.
+    this.elapsedSeconds += dt;
 
     const player = this.player;
     // Platforms move first so their per-step deltas are known when the player
@@ -333,7 +383,10 @@ export class Game {
     for (const it of this.interactables) it.update(dt, player, interactHeld);
     for (const d of this.doors) {
       d.update(dt);
-      this.handleDoorContact(d, player);
+      // An exit door ends the sector (run-end OR transition); bail out of the
+      // rest of this step immediately so we never touch a scene that onExit may
+      // have torn down (mirrors the damage paths' `return`).
+      if (this.handleDoorContact(d, player)) return;
     }
 
     this.entities.update(dt); // bobs collectibles + keys
@@ -351,6 +404,8 @@ export class Game {
         this.entities.remove(c);
         this.particles.spawnBurst(c.x + c.w / 2, c.y + c.h / 2, COLLECT_COLOR, 12);
         this.collectedCount++;
+        if (c === this.diamond) this.diamondCount++;
+        else this.coinCount++;
       }
     }
 
@@ -372,14 +427,63 @@ export class Game {
       }
     }
 
-    // Fell into a bottomless pit -> snap back to the respawn point and reset all
-    // platforms/doors/switches to their authored defaults (deterministic retry).
-    // The held key is intentionally NOT cleared (only a door consumes it).
+    // Spike traps: damage TRIGGERS, never solid. Skip entirely while invulnerable
+    // so the player passes harmlessly during the post-hit blink; otherwise the
+    // first overlap deals one point and (if non-fatal) respawns at checkpoint via
+    // the exact same path as a pit-fall. A fatal hit ends the run.
+    if (!player.invulnerable) {
+      for (const s of this.spikes) {
+        if (!overlaps(player, s)) continue;
+        if (player.takeDamage(1, 'spike')) {
+          this.endRun('gameover');
+          return;
+        }
+        this.respawnPlayer();
+        break;
+      }
+    }
+
+    // Patrol drones: resolve contact by direction. A STOMP (falling fast enough
+    // with the player's feet still in the drone's top band) kills the drone and
+    // bounces the player — allowed even mid-blink. ANY other contact routes
+    // through the exact spike damage path (i-frames there gate it), so it's
+    // skipped while invulnerable. A fatal hit ends the run; a survivable one
+    // respawns at the checkpoint (which also resets the drones).
+    for (const drone of this.drones) {
+      if (!drone.alive) continue;
+      if (!overlaps(player, drone)) continue;
+
+      const feetY = player.y + player.h;
+      const stomp = player.vy > STOMP_MIN_FALL_VY && feetY <= drone.y + STOMP_TOP_BAND;
+      if (stomp) {
+        drone.kill();
+        this.particles.spawnBurst(drone.x + drone.w / 2, drone.y + drone.h / 2, DRONE_COLOR, 14);
+        player.bounce(STOMP_BOUNCE_VY);
+        // TODO(score): award points for a drone stomp via the existing counters.
+        continue;
+      }
+
+      if (!player.invulnerable) {
+        if (player.takeDamage(1, 'drone')) {
+          this.endRun('gameover');
+          return;
+        }
+        this.respawnPlayer();
+        break;
+      }
+    }
+
+    // Fell into a bottomless pit -> route through the damage model. A fatal fall
+    // ends the run (game over); otherwise snap back to the respawn point (and
+    // reset every deterministic actor), keeping the i-frames takeDamage just
+    // granted. A fall during i-frames is ignored for life-loss but still respawns
+    // (no free death-spiral). The held key is NOT cleared (only a door consumes it).
     if (player.y > this.tilemap.pixelHeight) {
-      player.respawn();
-      for (const p of this.platforms) p.reset();
-      for (const d of this.doors) d.reset();
-      for (const it of this.interactables) it.resetOnCheckpoint();
+      if (player.takeDamage(1, 'pit')) {
+        this.endRun('gameover');
+        return;
+      }
+      this.respawnPlayer();
     }
 
     // Hard landing this frame -> a small screen shake.
@@ -391,42 +495,143 @@ export class Game {
   }
 
   /**
+   * Snap the player back to its current respawn point and reset every
+   * deterministic actor (platforms / doors / switches) to its authored default,
+   * so a retry plays identically. Shared by pit-falls and spike hits.
+   */
+  private respawnPlayer(): void {
+    if (!this.player) return;
+    this.player.respawn();
+    for (const p of this.platforms) p.reset();
+    for (const d of this.doors) d.reset();
+    for (const it of this.interactables) it.resetOnCheckpoint();
+    for (const dr of this.drones) dr.reset();
+  }
+
+  /**
    * Per-door contact effects the door can't do on its own: a locked door opens
    * (and consumes the key) when the player touches it carrying one; an exit door
    * fires the sector-complete trigger. A 2px pad lets a player standing flush
-   * against a closed door still register the touch.
+   * against a closed door still register the touch. Returns true ONLY when an
+   * exit door was reached, so the caller stops processing the rest of the step.
    */
-  private handleDoorContact(door: Door, player: Player): void {
+  private handleDoorContact(door: Door, player: Player): boolean {
     const pad = 2;
     const near =
       player.x < door.x + door.w + pad &&
       player.x + player.w > door.x - pad &&
       player.y < door.y + door.h + pad &&
       player.y + player.h > door.y - pad;
-    if (!near) return;
+    if (!near) return false;
 
     if (door.kind === 'locked' && player.heldKey && door.unlock()) {
       player.heldKey = false;
       this.particles?.spawnBurst(door.x + door.w / 2, door.y + door.h / 2, DOOR_COLOR, 16);
+      return false;
     } else if (door.kind === 'exit') {
       this.onExit();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Player reached the exit door. THE run-end-vs-transition fork:
+   *  - If this sector has a `next`: it's a SECTOR TRANSITION — do NOT call endRun,
+   *    do NOT fire dispatchScore. Carry run-state forward and load the next sector.
+   *  - If there's no `next` (final sector): close the run via the single endRun
+   *    seam exactly as before (fires score once, COMPLETE tally).
+   * This is the only place the once-per-run invariant could be broken, so the
+   * non-final branch must never reach endRun/dispatchScore.
+   */
+  private onExit(): void {
+    const next = nextLevelKey(this.currentLevelKey);
+    if (next) {
+      void this.beginSectorTransition(next);
+    } else {
+      this.endRun('complete');
     }
   }
 
-  /** Player reached the exit: show the overlay, then reload after a beat. */
-  private onExit(): void {
-    if (this.sectorComplete) return;
-    this.sectorComplete = true;
-    this.exitReloadTimer = EXIT_RELOAD_DELAY;
+  /**
+   * Non-final sector cleared: carry run-state (score/coins/diamonds/time already
+   * accumulate on Game; lives is captured here) into the next sector and load it.
+   * Deliberately NOT a run-end — dispatchScore is never called on this path, so
+   * the once-per-run invariant holds. State flips to TRANSITION synchronously so
+   * the in-flight tick neither reschedules the loop nor touches the torn-down
+   * scene; the next sector loads with carry = true (run-state preserved). The
+   * post-await guard mirrors start(): if anything flipped us out of TRANSITION
+   * during the load, don't go live.
+   */
+  private async beginSectorTransition(next: LevelKey): Promise<void> {
+    // Snapshot the live lives count into the run-level carry slot.
+    this.runLives = this.player?.lives ?? this.runLives;
+
+    this.state = 'TRANSITION';
+    this.stopLoop();
+    this.unloadScene(); // release the cleared sector's entities/bitmaps/timers
+    this.renderLoading();
+
+    await this.loadScene(next, true); // carry = true: keep score/coins/time/lives
+    if (this.state !== 'TRANSITION') return; // bailed to MENU mid-load
+
+    this.state = 'PLAYING';
+    this.startLoop();
   }
 
-  /** Tear down and rebuild the test scene (placeholder for real sector flow). */
-  private async reloadScene(): Promise<void> {
-    if (this.reloading) return;
-    this.reloading = true;
-    this.unloadScene();
-    await this.loadTestScene();
-    this.reloading = false;
+  /**
+   * The single run-end seam for BOTH outcomes. Computes the score (a clean clear
+   * keeps the time bonus; a game-over keeps only the pickup score), fires the
+   * ARCADE_SCORE seam exactly once, reflects it in the snapshot, then transitions
+   * to the matching end screen and stops the loop. The `completed` guard makes
+   * any later call (a second exit touch, a fatal hit on the same frame) a no-op,
+   * so dispatchScore() can never double-fire or miss-fire.
+   */
+  private endRun(outcome: RunOutcome): void {
+    if (this.completed) return;
+    this.completed = true;
+
+    const includeTimeBonus = outcome === 'complete';
+    const result = computeScore(
+      this.coinCount,
+      this.diamondCount,
+      this.elapsedSeconds,
+      includeTimeBonus,
+    );
+    this.result = result;
+
+    // Persist the best score (both outcomes): if this run beat the stored best,
+    // save it and flag `newBest` so the end screen can celebrate. Storage failures
+    // are swallowed in the helper, so this never threatens the run-end seam.
+    this.newBest = result.score > this.bestScore;
+    if (this.newBest) {
+      this.bestScore = result.score;
+      saveBestScore(this.bestScore);
+    }
+
+    this.snapshot = {
+      score: result.score,
+      sector: this.currentSector,
+      completion: outcome === 'complete' ? 1 : 0,
+    };
+
+    dispatchScore(result.score, {
+      outcome,
+      coins: result.coins,
+      diamonds: result.diamonds,
+      timeSeconds: Math.floor(result.elapsedSeconds),
+      timeBonus: result.timeBonus,
+      sector: this.currentSector,
+    });
+
+    this.stopLoop();
+    if (outcome === 'complete') {
+      this.state = 'COMPLETE';
+      this.renderComplete();
+    } else {
+      this.state = 'GAME_OVER';
+      this.renderGameOver();
+    }
   }
 
   private render(alpha: number): void {
@@ -439,97 +644,225 @@ export class Game {
   // --- scene management -------------------------------------------------
 
   /**
-   * Load the movement test scene: tiles + characters sheets, the test-room
-   * Tilemap, a follow Camera, and the Player spawned on the left flat ground.
-   * Built into locals so a mid-load Esc->MENU can discard everything (and close
-   * both bitmaps) cleanly without ever assigning a half-built scene.
+   * Load a level by registry key (see src/levels). Terrain is authored as a paint
+   * grid run through the autotiler (render) + a derived occupancy mask (collision,
+   * every non-air paint cell is solid); the object arrays map onto the existing
+   * pickup / platform / door / switch systems. Built into locals so a mid-load
+   * Esc->MENU can discard everything (and close every bitmap) cleanly without ever
+   * assigning a half-built scene. No per-sector code lives here — adding a level is
+   * adding it to LEVELS.
+   *
+   * `carry` is THE run-state boundary: false (a fresh run from the menu) resets
+   * score/coins/diamonds/time and lives to defaults; true (a sector transition)
+   * preserves them so the HUD hearts/score continue uninterrupted across sectors.
    */
-  private async loadTestScene(): Promise<void> {
-    // Terrain stays on the packed sheet (its ids already match its filenames).
-    // Characters + backgrounds load as loose tiles so id === tile_NNNN.png number.
+  private async loadScene(key: LevelKey, carry: boolean): Promise<void> {
+    const level: LevelDef = LEVELS[key];
+
+    // Fresh run: wipe all RUN-LEVEL state to defaults BEFORE the new Player is
+    // built (so runLives is correct when applied below). A transition skips this
+    // entirely, carrying the accumulated totals + lives forward.
+    if (!carry) {
+      this.runLives = START_LIVES;
+      this.coinCount = 0;
+      this.diamondCount = 0;
+      this.elapsedSeconds = 0;
+      this.collectedCount = 0;
+    }
+
+    // Packed terrain sheet backs the gameplay ENTITIES (gems, key, lever, doors,
+    // platforms — their ids already match the loose filenames). Characters load
+    // as loose tiles. Terrain + decor render through the loose TileRenderer.
     const [tilesBitmap, characterTiles, backgroundTiles] = await Promise.all([
       loadImageBitmap('assets/kenney/base/Tilemap/tilemap_packed.png'),
-      LooseTileSet.load('assets/kenney/base/Tiles/Characters', [0, 1, 2, 3, 4, 5, 6, 7]),
+      // 0-7 back the player; 15/16 are the patrol-drone walk frames (placeholder).
+      LooseTileSet.load('assets/kenney/base/Tiles/Characters', [0, 1, 2, 3, 4, 5, 6, 7, 15, 16]),
       LooseTileSet.load(
         'assets/kenney/base/Tiles/Backgrounds',
         Array.from({ length: 24 }, (_, i) => i),
       ),
     ]);
     const tileSheet = new SpriteSheet(tilesBitmap, { tileSize: TILE });
-    const tilemap = new Tilemap(testRoom as TilemapData, {
-      tiles: tileSheet,
-      backgrounds: backgroundTiles,
-    });
-    // Layered parallax backdrop (Sector 1 will pick its theme later). Shares the
-    // backgrounds LooseTileSet; it draws, but owns no bitmaps to dispose.
-    const background = new Background(THEMES.teal, backgroundTiles);
+    // Per-level backdrop theme (Sector 1 teal sky, Sector 2 earthy cave).
+    const background = new Background(level.theme, backgroundTiles);
 
-    // Spawn on the left flat-ground baseline (ground top row 13 -> feet at y=234).
-    const spawnX = 3 * TILE;
-    const spawnY = 13 * TILE - 16;
-    const player = new Player(DEFAULT_MOVEMENT, spawnX, spawnY, characterTiles, tilemap, this.input!);
+    // Terrain: paint grid -> render id grid (autotiler) + 0/1 occupancy mask
+    // (collision). The Tilemap is built from the mask and used ONLY for collision
+    // and level dimensions; terrain pixels come from the autotiled grid below.
+    const terrainGrid = autotile([...level.paint]);
+    const foregroundGrid = autotile([...level.foregroundPaint]);
+    const occupancy = level.paint.map((line) => [...line].map((ch) => (ch === PAINT.AIR ? 0 : 1)));
+    const tilemapData: TilemapData = {
+      width: level.width,
+      height: level.height,
+      tileSize: TILE,
+      family: 'grass',
+      layers: [{ name: 'terrain', collision: true, data: occupancy }],
+    };
+    const tilemap = new Tilemap(tilemapData, { tiles: tileSheet });
+
+    // Load every loose tile the terrain grid, foreground grid + decor reference.
+    const terrain = new TileRenderer();
+    // Expand each decor id to every animation frame it can show (flag cloth,
+    // water/waterfall pairs, …) so the loose renderer has all frames preloaded.
+    const decorIds = [...level.decor, ...level.skyDecor].flatMap((d) => [
+      ...animationFramesFor(d.id),
+    ]);
+    await terrain.load([...terrainGrid.flat(), ...foregroundGrid.flat(), ...decorIds]);
+
+    const player = new Player(
+      DEFAULT_MOVEMENT,
+      level.spawn.x,
+      level.spawn.y,
+      characterTiles,
+      tilemap,
+      this.input!,
+    );
+    // Apply the run-level lives carry: START_LIVES on a fresh run, or the count
+    // carried from the previous sector on a transition.
+    player.lives = this.runLives;
     const camera = new Camera();
     camera.snapTo(player, tilemap);
 
-    // Spawn level-authored pickups/checkpoints. Gem + flag tiles live on the
-    // terrain packed sheet, so collectibles/checkpoints draw through tileSheet.
+    // --- object layer -> existing entity systems (all draw via tileSheet) ---
     const entities = new EntityManager();
     const collectibles: Collectible[] = [];
-    const platforms: Platform[] = [];
-    const doors: Door[] = [];
-    const keys: Key[] = [];
-    let checkpoint: Checkpoint | null = null;
-    // Interactables are spawned in a second pass, after the registry of all
-    // Activatables (doors + controlled platforms) exists for them to target.
-    const interactableSpecs: LevelEntity[] = [];
-    const levelEntities = (testRoom as TilemapData & { entities?: LevelEntity[] }).entities ?? [];
-    for (const e of levelEntities) {
-      // Dev-only: flag an entity authored on top of solid terrain (e.g. a
-      // platform overlapping the ground). Cheap sanity check, not a registry.
-      if (import.meta.env.DEV && tilemap.isSolid(e.tx, e.ty)) {
-        console.warn(
-          `Level: ${e.type} anchor tile (${e.tx},${e.ty}) is inside solid terrain.`,
-        );
-      }
-      if (e.type === 'collectible') {
-        const c = new Collectible(tileSheet, e.tx * TILE, e.ty * TILE);
-        entities.add(c);
-        collectibles.push(c);
-      } else if (e.type === 'checkpoint') {
-        checkpoint = new Checkpoint(tileSheet, e.tx * TILE, e.ty * TILE);
-        entities.add(checkpoint);
-      } else if (e.type === 'platform') {
-        const platform = this.makePlatform(e, tileSheet, tilemap.pixelHeight);
-        if (platform) platforms.push(platform);
-      } else if (e.type === 'door') {
-        doors.push(this.makeDoor(e, tileSheet));
-      } else if (e.type === 'key') {
-        const k = new Key(tileSheet, e.tx * TILE, e.ty * TILE);
-        entities.add(k);
-        keys.push(k);
-      } else if (e.type === 'interactable') {
-        interactableSpecs.push(e);
-      }
+    for (const c of level.coins) {
+      const coin = new Collectible(tileSheet, c.col * TILE, c.row * TILE, COIN_ID);
+      entities.add(coin);
+      collectibles.push(coin);
+    }
+    // The diamond is tracked apart from coins for scoring; a level may omit it.
+    let diamond: Collectible | null = null;
+    if (level.diamond) {
+      diamond = new Collectible(tileSheet, level.diamond.col * TILE, level.diamond.row * TILE, DIAMOND_ID);
+      entities.add(diamond);
+      collectibles.push(diamond);
     }
 
-    // Registry of everything a switch can drive: doors (by id) and controlled
-    // platforms (by id). Then build the switches that target them.
-    const registry = new Map<string, Activatable>();
-    for (const d of doors) registry.set(d.id, d);
-    for (const p of platforms) {
-      if (p instanceof MovingPlatform && p.controlled) registry.set(p.id, p);
+    // Key pickup (optional): grabbing it sets player.heldKey, opening locked doors.
+    const keys: Key[] = [];
+    if (level.key) {
+      const keyPickup = new Key(tileSheet, level.key.col * TILE, level.key.row * TILE, KEY_ID);
+      entities.add(keyPickup);
+      keys.push(keyPickup);
     }
+
+    // Spikes: static damage TRIGGERS (NOT solid). Rendered via the EntityManager
+    // like other pickups; overlap is checked in update() against takeDamage().
+    const spikes: Spike[] = [];
+    for (const s of level.spikes) {
+      const spike = new Spike(tileSheet, s.col * TILE, s.row * TILE);
+      entities.add(spike);
+      spikes.push(spike);
+    }
+
+    // Patrol drones: ground enemies that render/update via the EntityManager
+    // like other entities; contact (stomp vs side-hit) is resolved in update().
+    // They hold the tilemap for their own wall/ledge turn tests.
+    const drones: PatrolDrone[] = [];
+    for (const d of level.drones) {
+      const drone = new PatrolDrone(characterTiles, tilemap, d.col, d.row, d.dir);
+      entities.add(drone);
+      drones.push(drone);
+    }
+
+    // Checkpoint stays a gameplay trigger (respawn), but is NOT added to the
+    // rendered entities — its visual is the flag() structure in the decor layer.
+    const checkpoint = new Checkpoint(
+      tileSheet,
+      level.checkpoint.col * TILE,
+      level.checkpoint.row * TILE,
+    );
+
+    const platforms: Platform[] = [];
+    // One-way platforms (top-only collision): wood bridges + floating tiles.
+    for (const w of level.oneWayPlatforms) {
+      platforms.push(
+        new CloudPlatform(tileSheet, ONE_WAY_ART[w.art], w.col * TILE, w.row * TILE, w.wTiles * TILE),
+      );
+    }
+    // Switch-controlled vertical lifts: rest low until their switch toggles them.
+    const registry = new Map<string, Activatable>();
+    for (const m of level.movingPlatforms) {
+      const lift = new MovingPlatform(
+        tileSheet,
+        MOVING_ART,
+        m.col * TILE,
+        m.lowRow * TILE,
+        m.col * TILE,
+        m.highRow * TILE,
+        m.wTiles * TILE,
+        m.speed,
+        true,
+        m.id,
+      );
+      platforms.push(lift);
+      registry.set(lift.id, lift);
+    }
+    // Falling platforms: timing commitments that drop once stood on.
+    // `tilemap.pixelHeight` is the y past which they count as gone.
+    for (const f of level.fallingPlatforms) {
+      platforms.push(
+        new FallingPlatform(
+          tileSheet,
+          FALLING_ART,
+          f.col * TILE,
+          f.row * TILE,
+          f.wTiles * TILE,
+          tilemap.pixelHeight,
+        ),
+      );
+    }
+
+    // Doors: the exit (never solid; touching it completes the sector) + any
+    // key-locked doors (closed solids until the held key opens them).
+    const doors: Door[] = [
+      new Door(
+        tileSheet,
+        DOOR_CLOSED_TILE,
+        'exit',
+        'exit',
+        level.exit.col * TILE,
+        level.exit.row * TILE,
+        level.exit.hTiles,
+      ),
+    ];
+    for (const ld of level.lockedDoors) {
+      doors.push(
+        new Door(tileSheet, DOOR_CLOSED_TILE, ld.id, 'locked', ld.col * TILE, ld.row * TILE, ld.hTiles),
+      );
+    }
+
+    // Switches -> their targets, via the activatable registry (lever/button skin).
     const interactables: Interactable[] = [];
-    for (const e of interactableSpecs) {
-      interactables.push(this.makeInteractable(e, tileSheet, registry));
+    for (const sw of level.switches) {
+      const skin = sw.kind === 'lever' ? LEVER_TILE : BUTTON_TILE;
+      interactables.push(
+        new Interactable(
+          tileSheet,
+          skin,
+          sw.col * TILE,
+          sw.row * TILE,
+          sw.mode,
+          sw.holdTime,
+          'movePlatform',
+          [sw.targetId],
+          registry,
+        ),
+      );
     }
 
     const particles = new ParticlePool();
 
-    if (this.state !== 'PLAYING') {
+    // Commit only if we're still loading for play. PLAYING is a fresh run/start;
+    // TRANSITION is a sector handoff. Any other state (Esc->MENU mid-load) discards
+    // the freshly built scene and closes its bitmaps instead of going live.
+    if (this.state !== 'PLAYING' && this.state !== 'TRANSITION') {
       tileSheet.dispose();
       characterTiles.dispose();
       backgroundTiles.dispose();
+      terrain.dispose();
       return;
     }
 
@@ -537,6 +870,11 @@ export class Game {
     this.characterTiles = characterTiles;
     this.backgroundTiles = backgroundTiles;
     this.background = background;
+    this.terrain = terrain;
+    this.terrainGrid = terrainGrid;
+    this.foregroundGrid = foregroundGrid;
+    this.decor = level.decor;
+    this.skyDecor = level.skyDecor;
     this.tilemap = tilemap;
     this.player = player;
     this.camera = camera;
@@ -547,83 +885,22 @@ export class Game {
     this.doors = doors;
     this.interactables = interactables;
     this.keys = keys;
+    this.spikes = spikes;
+    this.drones = drones;
     this.checkpoint = checkpoint;
-    this.collectedCount = 0;
+    this.diamond = diamond;
+    this.currentSector = level.sector;
+    this.currentLevelKey = key;
+    // Per-scene state (always reset, independent of run-state carry): the
+    // single-fire guard, the tally, and the input edge latch. Run-level counters
+    // (coins/diamonds/time/lives) were handled by the `carry` branch above.
+    this.completed = false;
+    this.result = null;
     this.prevKeyK = false;
-    this.sectorComplete = false;
-    this.exitReloadTimer = 0;
+    this.snapshot = { score: 0, sector: level.sector, completion: 0 };
   }
 
-  /**
-   * Build a platform entity from a level "platform" entry. Platforms draw
-   * through the terrain TileSource (their skins live on the packed sheet).
-   * `fallLimit` is the world y below which a falling platform is gone.
-   */
-  private makePlatform(e: LevelEntity, source: TileSource, fallLimit: number): Platform | null {
-    const x = e.tx * TILE;
-    const y = e.ty * TILE;
-    const wPx = (e.wTiles ?? 1) * TILE;
-    switch (e.kind) {
-      case 'moving': {
-        const bx = (e.tx2 ?? e.tx) * TILE;
-        const by = (e.ty2 ?? e.ty) * TILE;
-        return new MovingPlatform(
-          source,
-          MOVING_ART,
-          x,
-          y,
-          bx,
-          by,
-          wPx,
-          e.speed ?? 60,
-          e.controlled ?? false,
-          e.id ?? '',
-        );
-      }
-      case 'falling':
-        return new FallingPlatform(source, FALLING_ART, x, y, wPx, fallLimit);
-      case 'cloud':
-        return new CloudPlatform(source, CLOUD_ART, x, y, wPx);
-      default:
-        return null;
-    }
-  }
-
-  /** Build a door entity from a level "door" entry. */
-  private makeDoor(e: LevelEntity, source: TileSource): Door {
-    return new Door(
-      source,
-      DOOR_CLOSED_TILE,
-      e.id ?? '',
-      (e.kind as DoorKind) ?? 'permanent',
-      e.tx * TILE,
-      e.ty * TILE,
-      e.hTiles ?? 2,
-      e.duration ?? undefined,
-    );
-  }
-
-  /** Build a switch (lever/button/chain) from a level "interactable" entry. */
-  private makeInteractable(
-    e: LevelEntity,
-    source: TileSource,
-    registry: Map<string, Activatable>,
-  ): Interactable {
-    const skin = SKIN_TILES[e.skin ?? 'lever'] ?? LEVER_TILE;
-    return new Interactable(
-      source,
-      skin,
-      e.tx * TILE,
-      e.ty * TILE,
-      (e.mode as InteractMode) ?? 'oneshot',
-      e.holdTime ?? 0,
-      (e.effect as InteractEffect) ?? 'openDoor',
-      e.targets ?? [],
-      registry,
-    );
-  }
-
-  /** Close every ImageBitmap across all three tile sources; drop all refs. */
+  /** Close every ImageBitmap across all tile sources; drop all refs. */
   private unloadScene(): void {
     this.player?.destroy();
     this.entities?.clear();
@@ -631,10 +908,17 @@ export class Game {
     this.tileSheet?.dispose();
     this.characterTiles?.dispose();
     this.backgroundTiles?.dispose();
+    this.terrain?.dispose();
     this.player = null;
     this.camera = null;
     this.tilemap = null;
     this.background = null;
+    this.backgroundTiles = null;
+    this.terrain = null;
+    this.terrainGrid = [];
+    this.foregroundGrid = [];
+    this.decor = [];
+    this.skyDecor = [];
     this.entities = null;
     this.particles = null;
     this.collectibles = [];
@@ -642,14 +926,20 @@ export class Game {
     this.doors = [];
     this.interactables = [];
     this.keys = [];
+    this.spikes = [];
+    this.drones = [];
     this.checkpoint = null;
-    this.collectedCount = 0;
+    this.diamond = null;
+    // NOTE: run-level counters (coinCount/diamondCount/elapsedSeconds/
+    // collectedCount/runLives) are deliberately NOT cleared here — a sector
+    // transition unloads the old scene but must carry these forward. They are
+    // reset only on a fresh run (loadScene's `carry === false` branch). Only
+    // per-scene flags are cleared.
+    this.completed = false;
+    this.result = null;
     this.prevKeyK = false;
-    this.sectorComplete = false;
-    this.exitReloadTimer = 0;
     this.tileSheet = null;
     this.characterTiles = null;
-    this.backgroundTiles = null;
     this.accumulator = 0;
   }
 
@@ -671,6 +961,10 @@ export class Game {
       case 'PAUSED':
         if (e.code === 'KeyP') this.resume();
         else if (e.code === 'Escape') this.goToMenu();
+        break;
+      case 'COMPLETE':
+      case 'GAME_OVER':
+        if (e.code === 'Enter' || e.code === 'Escape') this.goToMenu();
         break;
     }
   }
@@ -695,6 +989,11 @@ export class Game {
     ctx.textBaseline = 'middle';
     ctx.font = '28px monospace';
     ctx.fillText('SECTOR RUNNER', width / 2, height / 2 - 16);
+
+    // Always show a target so there's something to beat.
+    ctx.fillStyle = BEST_COLOR;
+    ctx.font = '10px monospace';
+    ctx.fillText(`BEST: ${this.bestScore}`, width / 2, BEST_MENU_Y);
   }
 
   /** Draw the live scene: clear, tilemap, player, then debug overlays. */
@@ -707,56 +1006,182 @@ export class Game {
     ctx.fillStyle = '#10131c';
     ctx.fillRect(0, 0, width, height);
 
-    this.applyThemePreviewKeys();
-    // Parallax backdrop tracks the true (unshaken) camera x.
+    // Original soft cloud / tree-line parallax band. Tracks the true (unshaken)
+    // camera x; drawn first, no collision.
     this.background?.render(ctx, cam.x);
 
     // Screen shake offsets WORLD rendering only; HUD/debug stay still.
     const { ox, oy } = cam.renderOffset();
     const rx = cam.x + ox;
     const ry = cam.y + oy;
-    this.tilemap.render(ctx, rx, ry);
+    // Terrain + decor draw through the autotiler's loose TileRenderer: sky decor
+    // (clouds) behind the terrain grid, foreground decor (trees/signs/etc.) over.
+    if (this.terrain) {
+      // Paired decor tiles (flag cloth 111/112, the water/waterfall pairs) loop
+      // through the shared animator; non-paired ids pass straight through.
+      const t = this.elapsedSeconds;
+      for (const d of this.skyDecor) {
+        this.terrain.drawTile(ctx, animatedTileId(d.id, t), d.col * TILE - rx, d.row * TILE - ry, 1);
+      }
+      this.terrain.drawTileGrid(ctx, this.terrainGrid, -rx, -ry, 1);
+      for (const d of this.decor) {
+        this.terrain.drawTile(ctx, animatedTileId(d.id, t), d.col * TILE - rx, d.row * TILE - ry, 1);
+      }
+    }
     // Platforms/doors/switches render with the world but live outside the
     // EntityManager (so they update exactly once, in the right order). All sit
     // behind the player sprite.
     for (const p of this.platforms) p.render(ctx, alpha, rx, ry);
-    for (const d of this.doors) d.render(ctx, alpha, rx, ry);
-    this.entities?.render(ctx, alpha, rx, ry); // keys, collectibles, checkpoint
+    // The exit door's VISUAL is the door() structure in the decor layer; render
+    // only the other (none today) doors so it isn't drawn as a flat slab twice.
+    for (const d of this.doors) if (d.kind !== 'exit') d.render(ctx, alpha, rx, ry);
+    this.entities?.render(ctx, alpha, rx, ry); // keys, collectibles
     for (const it of this.interactables) it.render(ctx, alpha, rx, ry);
     this.player?.render(ctx, alpha, rx, ry);
     this.particles?.render(ctx, rx, ry);
 
-    // Atlas overlays for level authoring: G=terrain, H=characters, B=backgrounds.
+    // Decorative foreground depth: land masses that scroll faster than the camera
+    // and hug the bottom edge, occluding the player for "cut earth" depth. Purely
+    // visual; remove this block to toggle it off without touching gameplay.
+    if (this.terrain) {
+      const fx = cam.x * FOREGROUND_PARALLAX + ox;
+      const fy = cam.y + oy - FOREGROUND_Y_OFFSET;
+      this.terrain.drawTileGrid(ctx, this.foregroundGrid, -fx, -fy, 1);
+    }
+
+    // Atlas overlays for level authoring: G=terrain, H=characters.
     if (this.input?.isDown('KeyG') && this.tileSheet) {
       drawAtlas(ctx, this.tileSheet);
     } else if (this.input?.isDown('KeyH') && this.characterTiles) {
       drawAtlas(ctx, this.characterTiles);
-    } else if (this.input?.isDown('KeyB') && this.backgroundTiles) {
-      drawAtlas(ctx, this.backgroundTiles);
     }
 
-    this.drawDebugReadout(ctx);
+    // Real player HUD (screen-space, pinned top). Hearts/coins/score draw from
+    // the packed tile sheet via live reads. The old dev readout is now opt-in,
+    // held behind KeyB for movement tuning.
+    this.drawHud(ctx);
+    drawControlLegend(ctx);
+    drawInteractHint(ctx, this.currentInteractPrompt());
+    if (this.input?.isDown('KeyB')) this.drawDebugReadout(ctx);
+  }
 
-    // Sector-complete banner (HUD space, drawn over everything).
-    if (this.sectorComplete) {
-      ctx.fillStyle = 'rgba(8,14,24,0.7)';
-      ctx.fillRect(0, 0, width, height);
-      ctx.fillStyle = '#e8eefc';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.font = '20px monospace';
-      ctx.fillText('SECTOR COMPLETE', width / 2, height / 2);
+  /**
+   * The interact verb to prompt right now: the first in-range, still-actionable
+   * interactable's verb (e.g. "activate platform" for the bridge button), or null
+   * when none is in range. Reuses the interactable's own range check.
+   */
+  private currentInteractPrompt(): string | null {
+    if (!this.player) return null;
+    for (const it of this.interactables) {
+      if (it.wantsPrompt(this.player)) return it.promptVerb;
+    }
+    return null;
+  }
+
+  /** Compose the live HUD state and draw it in screen-space. */
+  private drawHud(ctx: CanvasRenderingContext2D): void {
+    if (!this.player || !this.tileSheet || !this.canvas) return;
+    // Live pickup score (coins+diamond, no time bonus): updates as collected,
+    // reusing the scoring module rather than holding a separate field.
+    const score = computeScore(this.coinCount, this.diamondCount, this.elapsedSeconds, false).score;
+    drawHud(ctx, this.tileSheet, this.canvas.width, {
+      lives: this.player.lives,
+      maxLives: START_LIVES,
+      score,
+      coins: this.coinCount,
+    });
+  }
+
+  /**
+   * Shared end-screen best-score line: "BEST: <n>" in screen-space, plus a
+   * "NEW BEST!" flourish underneath when this run beat the stored best. Used by
+   * both the COMPLETE and GAME_OVER screens so they stay in sync.
+   */
+  private drawBestLine(ctx: CanvasRenderingContext2D, width: number, y: number): void {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = BEST_COLOR;
+    ctx.font = '11px monospace';
+    ctx.fillText(`BEST: ${this.bestScore}`, width / 2, y);
+
+    if (this.newBest) {
+      ctx.fillStyle = NEW_BEST_COLOR;
+      ctx.font = '10px monospace';
+      ctx.fillText('NEW BEST!', width / 2, y + NEW_BEST_DY);
     }
   }
 
-  /** Dev aid: number keys 1-3 swap the live background theme for comparison. */
-  private applyThemePreviewKeys(): void {
-    const bg = this.background;
-    const input = this.input;
-    if (!bg || !input) return;
-    if (input.isDown('Digit1')) bg.setTheme(THEMES.teal);
-    else if (input.isDown('Digit2')) bg.setTheme(THEMES.orange);
-    else if (input.isDown('Digit3')) bg.setTheme(THEMES.green);
+  /**
+   * End-of-run tally: the dimmed final frame stays on the canvas (the loop is
+   * stopped) with the coin / diamond / time / total breakdown over it. Drawn
+   * once on completion; Enter returns to the menu.
+   */
+  private renderComplete(): void {
+    const ctx = this.canvas?.ctx;
+    if (!ctx || !this.canvas) return;
+    const { width, height } = this.canvas;
+    const r = this.result;
+
+    ctx.fillStyle = 'rgba(8,14,24,0.82)';
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.fillStyle = '#e8eefc';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.font = '20px monospace';
+    ctx.fillText('SECTOR COMPLETE', width / 2, 56);
+
+    if (r) {
+      ctx.font = '10px monospace';
+      const rows = [
+        `COINS    ${r.coins} x ${COIN_POINTS}`,
+        `DIAMOND  ${r.diamonds} x ${DIAMOND_POINTS}`,
+        `TIME     ${Math.floor(r.elapsedSeconds)}s  (+${r.timeBonus})`,
+      ];
+      for (let i = 0; i < rows.length; i++) {
+        ctx.fillText(rows[i], width / 2, 104 + i * 16);
+      }
+      ctx.font = '16px monospace';
+      ctx.fillStyle = '#9effa0';
+      ctx.fillText(`SCORE  ${r.score}`, width / 2, 176);
+    }
+
+    this.drawBestLine(ctx, width, BEST_COMPLETE_Y);
+
+    ctx.fillStyle = '#9aa6c4';
+    ctx.font = '9px monospace';
+    ctx.fillText('press ENTER to replay', width / 2, height - 22);
+  }
+
+  /**
+   * Game-over screen: drawn once when the run ends out of lives (the loop is
+   * stopped). Shows the final pickup-only score; Enter returns to the menu.
+   */
+  private renderGameOver(): void {
+    const ctx = this.canvas?.ctx;
+    if (!ctx || !this.canvas) return;
+    const { width, height } = this.canvas;
+
+    ctx.fillStyle = 'rgba(24,8,10,0.85)';
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.fillStyle = '#ff7a7a';
+    ctx.font = '24px monospace';
+    ctx.fillText('GAME OVER', width / 2, height / 2 - 28);
+
+    ctx.fillStyle = '#e8eefc';
+    ctx.font = '14px monospace';
+    ctx.fillText(`SCORE  ${this.result?.score ?? 0}`, width / 2, height / 2 + 6);
+
+    this.drawBestLine(ctx, width, BEST_GAMEOVER_Y);
+
+    ctx.fillStyle = '#9aa6c4';
+    ctx.font = '9px monospace';
+    ctx.fillText('press ENTER to return to menu', width / 2, height - 22);
   }
 
   /** Tiny top-left numeric readout so coyote/buffer feel is verifiable. */
@@ -773,6 +1198,7 @@ export class Game {
       `vy:${p.vy.toFixed(1)}`,
       `coyote:${p.coyoteTimer}`,
       `buffer:${p.jumpBufferTimer}`,
+      `lives:${p.lives}${p.invulnerable ? '*' : ''}`,
       `collected:${this.collectedCount}`,
       `key:${p.heldKey ? 1 : 0}`,
       `shake:${this.camera?.shakeEnabled ? 1 : 0}`,

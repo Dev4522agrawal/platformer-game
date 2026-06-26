@@ -21,6 +21,15 @@ const PLAYER_H = 16;
 /** Downward speed above which a landing counts as a hard impact (camera shake). */
 const LANDING_IMPACT_VY = 450;
 
+/** Lives a fresh run starts with. */
+export const START_LIVES = 3;
+
+/** Seconds of damage-immunity granted after a hit (sprite blinks for this long). */
+export const IFRAME_SECONDS = 1.5;
+
+/** Blink toggles per second while invulnerable (visible/hidden flicker rate). */
+export const IFRAME_BLINK_HZ = 10;
+
 const LEFT_KEYS = ['ArrowLeft', 'KeyA'] as const;
 const RIGHT_KEYS = ['ArrowRight', 'KeyD'] as const;
 const JUMP_KEYS = ['Space', 'ArrowUp', 'KeyW'] as const;
@@ -47,6 +56,14 @@ export class Player extends Entity {
 
   /** Holds a single key, used to open one locked door. Survives respawn. */
   heldKey = false;
+
+  /**
+   * Remaining lives. A fresh Player (built per scene load) starts at START_LIVES,
+   * so a new run resets these automatically. Survives a checkpoint respawn.
+   */
+  lives = START_LIVES;
+  /** Counts down while invulnerable after a hit; gates damage + the blink. */
+  private iframeTimer = 0;
   private isAscendingFromJump = false;
   /** Stays true only while the jump-hold is still boosting THIS jump's ascent. */
   private holdBoostActive = false;
@@ -110,10 +127,43 @@ export class Player extends Entity {
     this.respawnY = y;
   }
 
+  /** True while the post-hit invulnerability window is active. */
+  get invulnerable(): boolean {
+    return this.iframeTimer > 0;
+  }
+
+  /**
+   * Generic damage entry point — the seam hazards/enemies/boss call later. Damage
+   * is ignored while invulnerable; otherwise it deducts lives (clamped at 0) and
+   * opens an IFRAME_SECONDS window during which the sprite blinks.
+   *
+   * @returns true if this hit was fatal (lives reached 0).
+   */
+  takeDamage(amount = 1, _source?: string): boolean {
+    if (this.iframeTimer > 0) return false;
+    this.lives = Math.max(0, this.lives - amount);
+    this.iframeTimer = IFRAME_SECONDS;
+    return this.lives <= 0;
+  }
+
+  /**
+   * Apply an external upward impulse (e.g. stomping an enemy). Unlike a jump it
+   * ignores coyote/buffer and grants no variable-height hold boost, so it reads
+   * as a short bounce that normal fall gravity quickly arrests.
+   */
+  bounce(vy: number): void {
+    this.vy = vy;
+    this.grounded = false;
+    this.isAscendingFromJump = false;
+    this.holdBoostActive = false;
+    this.apexHangTimer = 0;
+  }
+
   update(dt: number, solids: readonly Solid[] = []): void {
     this.beginStep();
     const cfg = this.config;
     this.landingImpact = false; // one-shot, recomputed each step
+    if (this.iframeTimer > 0) this.iframeTimer = Math.max(0, this.iframeTimer - dt);
 
     // Ride: carry the motion of the platform we stood on last frame, applied
     // before integration so the collision passes see the carried position. The
@@ -237,6 +287,11 @@ export class Player extends Entity {
   }
 
   render(ctx: CanvasRenderingContext2D, alpha: number, camX: number, camY: number): void {
+    // Invulnerability blink: skip drawing on alternate intervals so the sprite
+    // flickers visibly on/off. Movement/collision are unaffected.
+    if (this.iframeTimer > 0 && Math.floor(this.iframeTimer * IFRAME_BLINK_HZ) % 2 === 1) {
+      return;
+    }
     const { x, y } = this.drawPos(alpha);
     const size = TILE;
     // Center the 18x18 sprite on the 12-wide box, feet aligned to the box bottom.
